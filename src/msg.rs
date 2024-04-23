@@ -1,12 +1,11 @@
 
 
 use cosmwasm_schema::cw_serde;
-use cosmwasm_std:: Uint128;
+use cosmwasm_std::{Decimal,  Uint128};
 use cw20::Cw20ReceiveMsg;
 use cw721::Cw721ReceiveMsg;
 
-use crate::state::{Config, LastDistributed, PendingRewards, RewardClaimed, RewardIndex, StakeAmount};
-
+use crate::state::Config;
 
 #[cw_serde]
 pub struct InstantiateMsg {
@@ -17,9 +16,6 @@ pub struct InstantiateMsg {
     pub xqtum_addr: String,
 
     pub nft_price: Uint128,
-
-    pub ninja_distribution_schedule: Vec<(u64, u64, Uint128)>,
-    pub scientist_distribution_schedule: Vec<(u64, u64, Uint128)>
 }
 
 #[cw_serde]
@@ -95,18 +91,24 @@ pub struct ConfigResponse {
 
 #[cw_serde]
 pub struct StateResponse {
-    pub total_staker: u64,
-    pub total_stake_amount: StakeAmount,
-    pub last_distributed: LastDistributed,
-    pub global_reward_index: RewardIndex
+    pub ninja_total_staker: u64,
+    pub ninja_total_stake_amount: Uint128,
+    pub ninja_last_distributed: u64,
+    pub ninja_global_reward_index: Decimal,
+    pub scientist_total_staker: u64,
+    pub scientist_total_stake_amount: Uint128,
+    pub scientist_last_distributed: u64,
+    pub scientist_global_reward_index: Decimal
 }
 
 #[cw_serde]
 pub struct StakerInfoResponse {
-    pub stake_amount: StakeAmount,
-    pub pending_rewards: PendingRewards,
-    pub reward_index: RewardIndex,
-    pub reward_claimed: RewardClaimed,
+    pub ninja_stake_amount: Uint128,
+    pub ninja_pending_rewards: Uint128,
+    pub ninja_reward_claimed: Uint128,
+    pub scientist_stake_amount: Uint128,
+    pub scientist_pending_rewards: Uint128,
+    pub scientist_reward_claimed: Uint128,
     pub ninja_locked: bool,
     pub scientist_locked: bool
 }

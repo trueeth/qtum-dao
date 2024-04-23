@@ -7,7 +7,7 @@ use cw721::Cw721ReceiveMsg;
 use cw721_base::{ExecuteMsg as Cw721ExecuteMsg, MintMsg};
 use crate::error::ContractError;
 use crate::msg::{ ConfigResponse, Cw20HookMsg, Cw721HookMsg, ExecuteMsg, InstantiateMsg, QueryMsg, StakerInfoResponse, StateResponse};
-use crate::state::{read_config, read_staker_info, read_state, remove_staker_info, store_config, store_staker_info, store_state, Config, LastDistributed, RewardIndex, StakeAmount, StakerInfo, State};
+use crate::state::{ Config, GuildState, StakerInfo, CONFIG, NINJA_STATE, NINJA_USERS, SCIENTIST_STATE, SCIENTIST_USERS};
 
 // version info for migration info
 const CONTRACT_NAME: &str = "crates.io:qtuamdao";
@@ -23,7 +23,7 @@ pub fn instantiate(
    
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
  
-    store_config(
+    CONFIG.save(
         deps.storage,
         &Config {
             owner: info.sender,
@@ -32,33 +32,34 @@ pub fn instantiate(
             qtum_addr: deps.api.addr_validate(&msg.qtum_addr)?,
             xqtum_addr:deps.api.addr_validate(&msg.xqtum_addr)?,
             nft_price: msg.nft_price,
-            ninja_distribution_schedule: msg.ninja_distribution_schedule,
-            scientist_distribution_schedule: msg.scientist_distribution_schedule,
+            ninja_distribution_schedule: vec![(0, 0, Uint128::zero())],
+            scientist_distribution_schedule: vec![(0,0,Uint128::zero())],
         },
     )?;
 
 
-    store_state(
+    NINJA_STATE.save(
         deps.storage,
-        &State {
+        &GuildState {
             total_staker: 0,
-            last_distributed: LastDistributed {
-                ninja: env.block.time.seconds(),
-                scientist: env.block.time.seconds(),
-            },
-            total_stake_amount: StakeAmount {
-                ninja: Uint128::zero(),
-                scientist: Uint128::zero()
-            },
-            global_reward_index: RewardIndex {
-                ninja: Decimal::zero(),
-                scientist: Decimal::zero()
-            },
+            last_distributed: env.block.time.seconds(),
+            total_stake_amount: Uint128::zero(),
+            global_reward_index: Decimal::zero(),
         },
     )?;
 
+    SCIENTIST_STATE.save(
+        deps.storage,
+        &GuildState {
+            total_staker: 0,
+            last_distributed: env.block.time.seconds(),
+            total_stake_amount: Uint128::zero(),
+            global_reward_index: Decimal::zero(),
+        },
+    )?;
 
     Ok(Response::default())
+
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -87,9 +88,10 @@ pub fn cw20_receive(
     cw20_msg: Cw20ReceiveMsg
 ) -> Result<Response, ContractError> {
 
-    let config: Config = read_config(deps.storage)?;
+    let config = CONFIG.load(deps.storage)?;
 
     match from_json(&cw20_msg.msg) {
+
         Ok(Cw20HookMsg::Mint { id , nft_addr}) => {
             // only qtum token contract can execute this message
             if config.qtum_addr != deps.api.addr_validate(info.sender.as_str())? {
@@ -127,7 +129,7 @@ pub fn cw721_receive(
     cw721_msg: Cw721ReceiveMsg
 ) -> Result<Response,ContractError> {
 
-    let config: Config = read_config(deps.storage)?;
+    let config = CONFIG.load(deps.storage)?;
 
     match from_json(&cw721_msg.msg) {
         Ok(Cw721HookMsg::Mint { id }) => {
@@ -159,25 +161,37 @@ pub fn stake_xqtum(
     nft_addr: String
 ) -> Result<Response, ContractError> {
 
-    let config: Config = read_config(deps.storage)?;
-    let mut state: State = read_state(deps.storage)?;
-    let mut staker_info: StakerInfo = read_staker_info(deps.storage, &sender)?;
+    let config = CONFIG.load(deps.storage)?;
 
+    let mut state : GuildState;
+    let mut staker_info: StakerInfo;
+    
     if nft_addr == config.ninja_nft_addr {
-        compute_ninja_reward(&config, &mut state, env.block.time.seconds());
-        compute_ninja_staker_reward(&state, &mut staker_info)?;
+        state = NINJA_STATE.load(deps.storage)?;
+        staker_info = NINJA_USERS.load(deps.storage, sender.as_str())?;
+        compute_reward(&config, &mut state, env.block.time.seconds());
+        compute_staker_reward(&state, &mut staker_info)?;
         // Increase bond_amount
-        increase_ninja_stake_amount(&mut state, &mut staker_info, amount);
+        increase_stake_amount(&mut state, &mut staker_info, amount);
+
+           // Store updated state with staker's staker_info
+       
+        NINJA_USERS.save(deps.storage, sender.as_str(), &staker_info)?;
+        NINJA_STATE.save(deps.storage, &state)?;
+
     } else {
-        compute_scientist_reward(&config, &mut state, env.block.time.seconds());
-        compute_scientist_staker_reward(&state, &mut staker_info)?;
+        state = SCIENTIST_STATE.load(deps.storage)?;
+        staker_info = SCIENTIST_USERS.load(deps.storage, sender.as_str())?;
+        compute_reward(&config, &mut state, env.block.time.seconds());
+        compute_staker_reward(&state, &mut staker_info)?;
         // Increase bond_amount
-        increase_scientist_stake_amount(&mut state, &mut staker_info, amount);
+        increase_stake_amount(&mut state, &mut staker_info, amount);
+
+        SCIENTIST_USERS.save(deps.storage, sender.as_str(), &staker_info)?;
+        SCIENTIST_STATE.save(deps.storage, &state)?;
     }
     
-    // Store updated state with staker's staker_info
-    store_staker_info(deps.storage, &sender, &staker_info)?;
-    store_state(deps.storage, &state)?;
+ 
 
     Ok(Response::new().add_attributes(vec![
         ("action", "bond"),
@@ -196,26 +210,45 @@ pub fn unstake_xqtum(
     nft_addr: String
 ) -> Result<Response, ContractError> {
 
-    let config: Config = read_config(deps.storage)?;
-    let mut state: State = read_state(deps.storage)?;
-    let mut staker_info: StakerInfo = read_staker_info(deps.storage, &sender)?;
+    let config = CONFIG.load(deps.storage)?;
+
+    let mut state: GuildState;
+    let mut staker_info: StakerInfo;
+
+   
 
 
     if nft_addr == config.ninja_nft_addr {
 
-        if staker_info.stake_amount.ninja < amount {
+        state = NINJA_STATE.load(deps.storage)?;
+        staker_info = NINJA_USERS.load(deps.storage, sender.as_str())?;
+
+        if staker_info.stake_amount < amount {
             return Err(ContractError::InsufficientToken {});
         }
 
-        compute_ninja_reward(&config, &mut state, env.block.time.seconds());
-        compute_ninja_staker_reward(&state, &mut staker_info)?;
+        compute_reward(&config, &mut state, env.block.time.seconds());
+        compute_staker_reward(&state, &mut staker_info)?;
         // decrease bond_amount
-        decrease_ninja_stake_amount(&mut state, &mut staker_info, amount);
+        decrease_stake_amount(&mut state, &mut staker_info, amount);
+
+
+        NINJA_USERS.save(deps.storage, sender.as_str(), &staker_info)?;
+        NINJA_STATE.save(deps.storage, &state)?;
+
+
     } else {
-        compute_scientist_reward(&config, &mut state, env.block.time.seconds());
-        compute_scientist_staker_reward(&state, &mut staker_info)?;
+
+        state = SCIENTIST_STATE.load(deps.storage)?;
+        staker_info = SCIENTIST_USERS.load(deps.storage, sender.as_str())?;
+
+        compute_reward(&config, &mut state, env.block.time.seconds());
+        compute_staker_reward(&state, &mut staker_info)?;
         // decrease bond_amount
-        decrease_scientist_stake_amount(&mut state, &mut staker_info, amount);
+        decrease_stake_amount(&mut state, &mut staker_info, amount);
+
+        SCIENTIST_USERS.save(deps.storage, sender.as_str(), &staker_info)?;
+        SCIENTIST_STATE.save(deps.storage, &state)?;
     }
 
     Ok(Response::new()
@@ -284,16 +317,18 @@ pub fn lock_nft(
     nft_addr: Addr,
 ) -> Result<Response, ContractError> {
 
-    let config: Config = read_config(deps.storage)?;
-    let mut staker_info: StakerInfo = read_staker_info(deps.storage, &sender)?;
-
+    let config: Config = CONFIG.load(deps.storage)?;
+    
     if  nft_addr == config.ninja_nft_addr  {
-        staker_info.ninja_locked = true
+        let mut staker_info: StakerInfo = NINJA_USERS.load(deps.storage, &sender.as_str())?;
+        staker_info.ninja_locked = true;
+        NINJA_USERS.save(deps.storage, &sender.as_str(), &staker_info)?;
     } else {
-        staker_info.scientist_locked = true
+        let mut staker_info: StakerInfo = SCIENTIST_USERS.load(deps.storage, &sender.as_str())?;
+        staker_info.scientist_locked = true;
+        SCIENTIST_USERS.save(deps.storage, &sender.as_str(), &staker_info)?;
     }
 
-    store_staker_info(deps.storage, &sender, &staker_info)?;
 
     Ok(Response::new()
         .add_attribute("action", "lock_nft")
@@ -313,16 +348,20 @@ pub fn unlock_nft(
     nft_addr: Addr,
 ) -> Result<Response, ContractError> {
 
-    let config: Config = read_config(deps.storage)?;
-    let mut staker_info: StakerInfo = read_staker_info(deps.storage, &sender)?;
+    let config: Config = CONFIG.load(deps.storage)?;
 
+    let mut staker_info : StakerInfo;
+    
     if  nft_addr == config.ninja_nft_addr  {
+        staker_info = NINJA_USERS.load(deps.storage, &sender.as_str())?;
         staker_info.ninja_locked = false;
+        NINJA_USERS.save(deps.storage, &sender.as_str(), &staker_info)?;
     } else {
-        staker_info.scientist_locked = false;
+        staker_info= SCIENTIST_USERS.load(deps.storage, &sender.as_str())?;
+        staker_info.ninja_locked = false;
+        SCIENTIST_USERS.save(deps.storage, &sender.as_str(), &staker_info)?;
     }
 
-    store_staker_info(deps.storage, &sender, &staker_info)?;
 
     Ok(Response::new()
         .add_attribute("action", "unlock_nft")
@@ -340,48 +379,54 @@ pub fn withdraw_reward(
     nft_addr: String
 ) -> Result<Response, ContractError> {
 
-    let config: Config = read_config(deps.storage)?;
-    let mut state: State = read_state(deps.storage)?;
-    let mut staker_info = read_staker_info(deps.storage, &info.sender)?;
-
+    let config: Config = CONFIG.load(deps.storage)?;
+    let mut guild_state : GuildState;
+    let mut staker_info : StakerInfo;
     let mut amount = Uint128::zero();
 
 
     if nft_addr == config.ninja_nft_addr {
 
+        guild_state = NINJA_STATE.load(deps.storage)?;
+        staker_info = NINJA_USERS.load(deps.storage, info.sender.as_str())?;
+
         // Compute global reward & staker reward
-        compute_ninja_reward(&config, &mut state, env.block.time.seconds());
-        compute_ninja_staker_reward(&state, &mut staker_info)?;
+        compute_reward(&config, &mut guild_state, env.block.time.seconds());
+        compute_staker_reward(&guild_state, &mut staker_info)?;
 
-        amount = staker_info.pending_rewards.ninja;
-        staker_info.pending_rewards.ninja = Uint128::zero();
+        amount = staker_info.pending_rewards;
+        staker_info.pending_rewards = Uint128::zero();
 
         // Store or remove updated rewards info
         // depends on the left pending reward and bond amount
-        if staker_info.stake_amount.ninja.is_zero() {
-            remove_staker_info(deps.storage, &info.sender);
+        if staker_info.stake_amount.is_zero() {
+            NINJA_USERS.remove(deps.storage, info.sender.as_str());
         } else {
-            store_staker_info(deps.storage, &info.sender, &staker_info)?;
+            NINJA_USERS.save(deps.storage, info.sender.as_str(), &staker_info)?;
         }
+        NINJA_STATE.save(deps.storage, &guild_state)?;
     } else if nft_addr == config.scientist_nft_addr {
-            // Compute global reward & staker reward
-        compute_scientist_reward(&config, &mut state, env.block.time.seconds());
-        compute_scientist_staker_reward(&state, &mut staker_info)?;
 
-        amount = staker_info.pending_rewards.scientist;
-        staker_info.pending_rewards.scientist = Uint128::zero();
+        guild_state = SCIENTIST_STATE.load(deps.storage)?;
+        staker_info = SCIENTIST_USERS.load(deps.storage, info.sender.as_str())?;
+            // Compute global reward & staker reward
+        compute_reward(&config, &mut guild_state, env.block.time.seconds());
+        compute_staker_reward(&guild_state, &mut staker_info)?;
+
+        amount = staker_info.pending_rewards;
+        staker_info.pending_rewards = Uint128::zero();
 
         // Store or remove updated rewards info
         // depends on the left pending reward and bond amount
-        if staker_info.stake_amount.scientist.is_zero() {
-            remove_staker_info(deps.storage, &info.sender);
+        if staker_info.stake_amount.is_zero() {
+            SCIENTIST_USERS.remove(deps.storage, info.sender.as_str());
         } else {
-            store_staker_info(deps.storage, &info.sender, &staker_info)?;
+            SCIENTIST_USERS.save(deps.storage, info.sender.as_str(), &staker_info)?;
         }
+        SCIENTIST_STATE.save(deps.storage, &guild_state)?;
     }
 
     // Store updated state
-    store_state(deps.storage, &state)?;
 
     Ok(Response::new()
         .add_messages(vec![CosmosMsg::Wasm(WasmMsg::Execute {
@@ -406,13 +451,13 @@ pub fn update_config(
     new_config: Config
 ) -> Result<Response,ContractError> {
 
-    let config = read_config(deps.storage)?;
+    let  config = CONFIG.load(deps.storage)?;
 
     if config.owner != info.sender {
         return Err(ContractError::Unauthorized {  });
     }
 
-    store_config(deps.storage, &new_config)?;
+    CONFIG.save(deps.storage, &new_config)?;
 
     Ok(Response::new().add_attributes(vec![("action", "update_config")]))
 }
@@ -426,7 +471,7 @@ pub fn set_distribution_schedule(
     distribution_schedule: Vec<(u64, u64, Uint128)>,
 ) -> Result<Response, ContractError> {
 
-    let mut config: Config = read_config(deps.storage)?;
+    let mut config = CONFIG.load(deps.storage)?;
 
 
     if info.sender != config.owner {
@@ -444,127 +489,66 @@ pub fn set_distribution_schedule(
 }
 
 
-
-fn compute_ninja_reward(config: &Config, state: &mut State, block_time: u64) {
+fn compute_reward(config: &Config, state: &mut GuildState, block_time: u64) {
    
 
-    if state.total_stake_amount.ninja.is_zero() {
-        state.last_distributed.ninja = block_time;
+    if state.total_stake_amount.is_zero() {
+        state.last_distributed = block_time;
         return;
     };
 
     let mut distributed_amount = Uint128::zero();
 
     for s in config.ninja_distribution_schedule.iter() {
-        if s.0 > block_time || s.1 < state.last_distributed.ninja {
+        if s.0 > block_time || s.1 < state.last_distributed {
             continue;
         }
 
-        let passed_time = std::cmp::min(s.1, block_time) - std::cmp::max(s.0, state.last_distributed.ninja);
+        let passed_time = std::cmp::min(s.1, block_time) - std::cmp::max(s.0, state.last_distributed);
 
         let time = s.1 - s.0;
         let distribution_amount_per_second = Decimal::from_ratio(s.2, time);
         distributed_amount += distribution_amount_per_second * Uint128::from(passed_time as u128);
     }
 
-    state.last_distributed.ninja = block_time;
-    state.global_reward_index.ninja = state.global_reward_index.ninja
-    + Decimal::from_ratio(distributed_amount, state.total_stake_amount.ninja);
+    state.last_distributed = block_time;
+    state.global_reward_index = state.global_reward_index
+    + Decimal::from_ratio(distributed_amount, state.total_stake_amount);
 }
 
 
-fn compute_scientist_reward(config: &Config, state: &mut State, block_time: u64) {
-   
 
-    if state.total_stake_amount.scientist.is_zero() {
-        state.last_distributed.scientist = block_time;
-        return;
-    };
-
-    let mut distributed_amount = Uint128::zero();
-
-    for s in config.scientist_distribution_schedule.iter() {
-        if s.0 > block_time || s.1 < state.last_distributed.scientist {
-            continue;
-        }
-
-        let passed_time = std::cmp::min(s.1, block_time) - std::cmp::max(s.0, state.last_distributed.scientist);
-
-        let time = s.1 - s.0;
-        let distribution_amount_per_second = Decimal::from_ratio(s.2, time);
-        distributed_amount += distribution_amount_per_second * Uint128::from(passed_time as u128);
-    }
-
-    state.last_distributed.scientist = block_time;
-    state.global_reward_index.scientist = state.global_reward_index.scientist
-    + Decimal::from_ratio(distributed_amount, state.total_stake_amount.scientist);
-}
-
-
-fn compute_ninja_staker_reward(
-    state: &State, 
+fn compute_staker_reward(
+    state: &GuildState, 
     staker_info: &mut StakerInfo
 ) -> StdResult<()> {
-    let pending_rewards = (staker_info.stake_amount.ninja * state.global_reward_index.ninja)
-        .checked_sub(staker_info.stake_amount.ninja * staker_info.reward_index.ninja)?;
+    let pending_rewards = (staker_info.stake_amount * state.global_reward_index)
+        .checked_sub(staker_info.stake_amount * staker_info.reward_index)?;
 
-    staker_info.reward_index.ninja = state.global_reward_index.ninja;
-    staker_info.pending_rewards.ninja += pending_rewards;
-    Ok(())
-}
-
-fn compute_scientist_staker_reward(
-    state: &State, 
-    staker_info: &mut StakerInfo
-) -> StdResult<()> {
-    let pending_rewards = (staker_info.stake_amount.scientist * state.global_reward_index.scientist)
-        .checked_sub(staker_info.stake_amount.scientist * staker_info.reward_index.scientist)?;
-
-    staker_info.reward_index.scientist = state.global_reward_index.scientist;
-    staker_info.pending_rewards.scientist += pending_rewards;
+    staker_info.reward_index = state.global_reward_index;
+    staker_info.pending_rewards += pending_rewards;
     Ok(())
 }
 
 
-fn increase_ninja_stake_amount(
-    state: &mut State, 
+
+fn increase_stake_amount(
+    state: &mut GuildState, 
     staker_info: &mut StakerInfo, 
     amount: Uint128
 ) {
-    state.total_stake_amount.ninja += amount;
-    staker_info.stake_amount.ninja += amount;
+    state.total_stake_amount += amount;
+    staker_info.stake_amount += amount;
 }
 
-fn decrease_ninja_stake_amount(
-    state: &mut State, 
+fn decrease_stake_amount(
+    state: &mut GuildState, 
     staker_info: &mut StakerInfo, 
     amount: Uint128
 ) {
-    state.total_stake_amount.ninja -= amount;
-    staker_info.stake_amount.ninja -= amount;
+    state.total_stake_amount -= amount;
+    staker_info.stake_amount -= amount;
 }
-
-
-
-fn increase_scientist_stake_amount(
-    state: &mut State, 
-    staker_info: &mut StakerInfo, 
-    amount: Uint128
-) {
-    state.total_stake_amount.scientist += amount;
-    staker_info.stake_amount.scientist += amount;
-}
-
-
-fn decrease_scientist_stake_amount(
-    state: &mut State, 
-    staker_info: &mut StakerInfo, 
-    amount: Uint128
-) {
-    state.total_stake_amount.scientist -= amount;
-    staker_info.stake_amount.scientist -= amount;
-}
-
 
 
 
@@ -582,7 +566,7 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
 
 
 pub fn query_config(deps: Deps) -> StdResult<ConfigResponse> {
-    let config = read_config(deps.storage)?;
+    let config = CONFIG.load(deps.storage)?;
     let resp = ConfigResponse {
         owner: config.owner.to_string(),
         scientist_nft_addr: config.scientist_nft_addr.to_string(),
@@ -598,20 +582,24 @@ pub fn query_config(deps: Deps) -> StdResult<ConfigResponse> {
 }
 
 
-
 pub fn query_state(deps: Deps, block_time: Option<u64>) -> StdResult<StateResponse> {
-    let mut state: State = read_state(deps.storage)?;
+    let mut scientist_state = SCIENTIST_STATE.load(deps.storage)?;
+    let mut ninja_state = NINJA_STATE.load(deps.storage)?;
     if let Some(block_time) = block_time {
-        let config = read_config(deps.storage)?;
-        compute_ninja_reward(&config, &mut state, block_time);
-        compute_scientist_reward(&config, &mut state, block_time);
+        let config = CONFIG.load(deps.storage)?;
+        compute_reward(&config, &mut scientist_state, block_time);
+        compute_reward(&config, &mut ninja_state, block_time);
     }
 
     Ok(StateResponse {
-        total_staker: state.total_staker,
-        total_stake_amount: state.total_stake_amount,
-        last_distributed: state.last_distributed,
-        global_reward_index: state.global_reward_index
+        ninja_total_staker: ninja_state.total_staker,
+        ninja_total_stake_amount: ninja_state.total_stake_amount,
+        ninja_last_distributed: ninja_state.last_distributed,
+        ninja_global_reward_index: ninja_state.global_reward_index,
+        scientist_total_staker: scientist_state.total_staker,
+        scientist_total_stake_amount: scientist_state.total_stake_amount,
+        scientist_last_distributed: scientist_state.last_distributed,
+        scientist_global_reward_index: scientist_state.global_reward_index
     })
 }
 
@@ -622,25 +610,30 @@ pub fn query_staker_info(
 ) -> StdResult<StakerInfoResponse> {
     let staker = deps.api.addr_validate(&staker)?;
 
-    let mut staker_info: StakerInfo = read_staker_info(deps.storage, &staker)?;
+    let mut ninja: StakerInfo = NINJA_USERS.load(deps.storage, staker.as_str())?;
+    let mut scientist: StakerInfo = NINJA_USERS.load(deps.storage, staker.as_str())?;
 
     if let Some(block_time) = block_time {
-        let config = read_config(deps.storage)?;
-        let mut state = read_state(deps.storage)?;
+        let config = CONFIG.load(deps.storage)?;
+        let mut ninja_guild_state = NINJA_STATE.load(deps.storage)?;
+        let mut scientist_guild_state = SCIENTIST_STATE.load(deps.storage)?;
 
-        compute_ninja_reward(&config, &mut state, block_time);
-        compute_scientist_reward(&config, &mut state, block_time);
-        compute_ninja_staker_reward(&state, &mut staker_info)?;
-        compute_scientist_staker_reward(&state, &mut staker_info)?;
+        compute_reward(&config, &mut ninja_guild_state, block_time);
+        compute_reward(&config, &mut scientist_guild_state, block_time);
+
+        compute_staker_reward(&ninja_guild_state, &mut ninja)?;
+        compute_staker_reward(&scientist_guild_state, &mut scientist)?;
     }
 
     Ok(StakerInfoResponse {
-        stake_amount: staker_info.stake_amount,
-        pending_rewards: staker_info.pending_rewards,
-        reward_index: staker_info.reward_index,
-        reward_claimed: staker_info.reward_claimed,
-        ninja_locked: staker_info.ninja_locked,
-        scientist_locked: staker_info.scientist_locked
+        ninja_stake_amount: ninja.stake_amount,
+        ninja_pending_rewards: ninja.pending_rewards,        
+        ninja_reward_claimed: ninja.reward_claimed,
+        scientist_stake_amount: scientist.stake_amount,
+        scientist_pending_rewards: scientist.pending_rewards,        
+        scientist_reward_claimed: scientist.reward_claimed,
+        ninja_locked: ninja.ninja_locked,
+        scientist_locked: scientist.scientist_locked
     })
 }
 
