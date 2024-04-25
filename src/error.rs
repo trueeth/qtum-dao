@@ -18,8 +18,8 @@ pub enum ContractError {
     #[error("NFT is not supported")]
     UnsupportedNft {},
 
-    #[error("Custom Error val: {val:?}")]
-    CustomError { val: String },
+    #[error("Custom Error val: {msg:?}")]
+    CustomError { msg: String },
     // Add any other custom errors you like here.
     // Look at https://docs.rs/thiserror/1.0.21/thiserror/ for details.
 }
